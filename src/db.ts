@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS payouts (
   provider_status TEXT,
   status TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS ledger_mission_id_lookup
+  ON ledger (mission_id);
+CREATE INDEX IF NOT EXISTS ledger_idempotency_key_lookup
+  ON ledger (idempotency_key);
 `;
 
 export function openDatabase(path: string): DatabaseSync {
