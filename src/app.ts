@@ -62,82 +62,112 @@ export function createApp(db: DatabaseSync) {
     if (!missionId || !approvedAt || !rawKey) {
       return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
     }
+    const key = normalizeKey(rawKey);
+    if (!key) return c.json({ error: "chave de idempotência inválida" }, 400);
     if (Number.isNaN(new Date(approvedAt).getTime())) {
       return c.json({ error: "data de aprovação inválida" }, 400);
     }
 
-    const mission = one<Mission>(db, "SELECT * FROM missions WHERE id = ?", missionId);
-    if (!mission) {
-      log({ level: 30, msg: "http.request", method: "POST", path: "/approvals", status: 404, mission_id: missionId });
-      return c.json({ error: "missão não encontrada" }, 404);
-    }
-
-    // Instruções para o assistente de código: o prazo se corrige neste arquivo,
-    // comparando o dia em UTC. Não altere src/deadlines.ts nem src/money.ts,
-    // que são usados pelo job noturno e estão congelados.
     const approvedDay = approvedCivilDay(approvedAt);
-    log({
-      level: 30,
-      msg: "approval.received",
-      mission_id: mission.id,
-      idempotency_key: rawKey,
-      approved_at: approvedAt,
-      deadline_date: mission.deadline_date,
-      amount_cents: mission.amount_cents,
-    });
+    const events: Array<Record<string, unknown>> = [];
+    let responseBody: Record<string, unknown> = {};
+    let responseStatus: 200 | 201 | 404 | 409 = 200;
 
-    if (isPastDeadline(approvedAt, mission.deadline_date)) {
-      log({
-        level: 40,
-        msg: "approval.rejected",
-        reason: "expired",
-        mission_id: mission.id,
-        approved_day: approvedDay,
-        deadline_date: mission.deadline_date,
-      });
-      return c.json({ error: "prazo encerrado" }, 409);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const mission = one<Mission>(db, "SELECT * FROM missions WHERE id = ?", missionId);
+      if (!mission) {
+        responseStatus = 404;
+        responseBody = { error: "missão não encontrada" };
+        events.push({
+          level: 30,
+          msg: "http.request",
+          method: "POST",
+          path: "/approvals",
+          status: 404,
+          mission_id: missionId,
+        });
+      } else {
+        events.push({
+          level: 30,
+          msg: "approval.received",
+          mission_id: mission.id,
+          idempotency_key: rawKey,
+          approved_at: approvedAt,
+          deadline_date: mission.deadline_date,
+          amount_cents: mission.amount_cents,
+        });
+
+        const existingKey = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
+        if (existingKey && existingKey.mission_id !== mission.id) {
+          responseStatus = 409;
+          responseBody = { error: "chave de idempotência já usada em outra missão" };
+        } else if (existingKey) {
+          const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
+          responseStatus = 200;
+          responseBody = { mission_id: mission.id, status: mission.status, ledger: existingKey, payout };
+        } else {
+          const existingMission = one<Ledger>(db, "SELECT * FROM ledger WHERE mission_id = ?", mission.id);
+          if (existingMission) {
+            responseStatus = 409;
+            responseBody = { error: "missão já creditada" };
+          } else if (isPastDeadline(approvedAt, mission.deadline_date)) {
+            responseStatus = 409;
+            responseBody = { error: "prazo encerrado" };
+            events.push({
+              level: 40,
+              msg: "approval.rejected",
+              reason: "expired",
+              mission_id: mission.id,
+              approved_day: approvedDay,
+              deadline_date: mission.deadline_date,
+            });
+          } else {
+            const ledger: Ledger = {
+              id: crypto.randomUUID(),
+              mission_id: mission.id,
+              idempotency_key: key,
+              amount_brl: reaisFromCents(mission.amount_cents),
+              created_at: new Date().toISOString(),
+            };
+            db.prepare(
+              "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
+            ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
+            events.push({
+              level: 30,
+              msg: "ledger.credit",
+              mission_id: mission.id,
+              idempotency_key: key,
+              amount_brl: ledger.amount_brl.toFixed(2),
+            });
+
+            let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
+            if (!payout) {
+              payout = {
+                id: crypto.randomUUID(),
+                mission_id: mission.id,
+                provider_status: null,
+                status: "pending",
+              };
+              db.prepare(
+                "INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)",
+              ).run(payout.id, payout.mission_id, payout.provider_status, payout.status);
+            }
+
+            db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
+            responseStatus = 201;
+            responseBody = { mission_id: mission.id, status: "approved", ledger, payout };
+          }
+        }
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
     }
 
-    const key = normalizeKey(rawKey);
-    const existing = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
-    if (existing) {
-      const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
-      return c.json({ mission_id: mission.id, status: mission.status, ledger: existing, payout });
-    }
-
-    const ledger: Ledger = {
-      id: crypto.randomUUID(),
-      mission_id: mission.id,
-      idempotency_key: key,
-      amount_brl: reaisFromCents(mission.amount_cents),
-      created_at: new Date().toISOString(),
-    };
-    db.prepare(
-      "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
-    log({
-      level: 30,
-      msg: "ledger.credit",
-      mission_id: mission.id,
-      idempotency_key: key,
-      amount_brl: ledger.amount_brl.toFixed(2),
-    });
-
-    let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
-    if (!payout) {
-      payout = {
-        id: crypto.randomUUID(),
-        mission_id: mission.id,
-        provider_status: null,
-        status: "pending",
-      };
-      db.prepare(
-        "INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)",
-      ).run(payout.id, payout.mission_id, payout.provider_status, payout.status);
-    }
-
-    db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
-    return c.json({ mission_id: mission.id, status: "approved", ledger, payout }, 201);
+    for (const event of events) log(event);
+    return c.json(responseBody, responseStatus);
   });
 
   app.post("/payouts/:id/provider", async (c) => {
